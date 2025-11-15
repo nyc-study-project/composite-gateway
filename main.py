@@ -10,9 +10,11 @@ from httpx import AsyncClient, HTTPStatusError, RequestError
 from fastapi import FastAPI, HTTPException, Body
 
 COMPOSITE_SERVICE_NAME = "Composite Gateway"
-
 USER_SERVICE_URL = os.getenv("USER_SERVICE_URL", "http://localhost:8001")
-SPOT_SERVICE_URL = os.getenv("SPOT_SERVICE_URL", "http://localhost:8002")
+SPOT_SERVICE_URL = os.getenv(
+    "SPOT_SERVICE_URL",
+    "https://spot-management-642518168067.us-east1.run.app",
+)
 REVIEWS_SERVICE_URL = os.getenv("REVIEWS_SERVICE_URL", "http://localhost:8003")
 
 DEFAULT_TIMEOUT = 5.0  # seconds
@@ -58,7 +60,8 @@ async def get_spot_full(spot_id: str):
     """
     async with AsyncClient() as client:
         try:
-            spot_task = _get_json(client, f"{SPOT_SERVICE_URL}/spots/{spot_id}")
+            spot_task = _get_json(client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}")
+
             reviews_task = _get_json(
                 client, f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}"
             )
@@ -86,9 +89,9 @@ async def get_spot_full(spot_id: str):
 
 @app.get("/api/spots/{spot_id}")
 async def proxy_get_spot(spot_id: str):
-    """Façade that proxies GET spot by ID to the Spot service."""
+    """Façade that proxies GET studyspot by ID to the Spot service."""
     async with AsyncClient() as client:
-        resp = await client.get(f"{SPOT_SERVICE_URL}/spots/{spot_id}")
+        resp = await client.get(f"{SPOT_SERVICE_URL}/studyspots/{spot_id}")
     return resp.json(), resp.status_code, resp.headers.items()
 
 
@@ -128,7 +131,7 @@ async def create_review_with_fk_check(payload: dict = Body(...)):
 
     async with AsyncClient() as client:
         spot_resp, user_resp = await asyncio.gather(
-            client.get(f"{SPOT_SERVICE_URL}/spots/{spot_id}"),
+            client.get(f"{SPOT_SERVICE_URL}/studyspots/{spot_id}"),
             client.get(f"{USER_SERVICE_URL}/users/{user_id}"),
         )
 
@@ -165,7 +168,9 @@ async def create_review_with_fk_check(payload: dict = Body(...)):
 async def start_geocode_job(spot_id: str):
     """Proxy to Spot service async geocode."""
     async with AsyncClient() as client:
-        resp = await client.post(f"{SPOT_SERVICE_URL}/spots/{spot_id}/geocode")
+        resp = await client.post(
+            f"{SPOT_SERVICE_URL}/studyspots/{spot_id}/geocode"
+        )
 
     return (
         resp.json()
@@ -176,11 +181,11 @@ async def start_geocode_job(spot_id: str):
     )
 
 
-@app.get("/api/tasks/{task_id}")
-async def get_task_status(task_id: str):
-    """Polling endpoint that proxies task status from the Spot service."""
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """Polling endpoint that proxies job status from the Spot service."""
     async with AsyncClient() as client:
-        resp = await client.get(f"{SPOT_SERVICE_URL}/tasks/{task_id}")
+        resp = await client.get(f"{SPOT_SERVICE_URL}/jobs/{job_id}")
 
     return resp.json(), resp.status_code, resp.headers.items()
 
