@@ -46,7 +46,8 @@ def test_composite_stub():
     spot_id = "test-spot-123"
 
     with respx.mock:
-        respx.get(f"{SPOT_SERVICE_URL}/spots/{spot_id}").mock(
+        # **FIX:** Changed /spots/{spot_id} to /studyspots/{spot_id}
+        respx.get(f"{SPOT_SERVICE_URL}/studyspots/{spot_id}").mock(
             return_value=httpx.Response(
                 200, json={"id": spot_id, "name": "Test Spot"}
             )

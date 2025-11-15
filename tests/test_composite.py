@@ -20,7 +20,8 @@ def test_fanout_ok():
     spot_id = "abc"
 
     with respx.mock:
-        respx.get(f"{SPOT_SERVICE_URL}/spots/{spot_id}").mock(
+        # **FIX:** Changed /spots/{spot_id} to /studyspots/{spot_id}
+        respx.get(f"{SPOT_SERVICE_URL}/studyspots/{spot_id}").mock(
             return_value=httpx.Response(200, json={"id": spot_id, "name": "Cafe"})
         )
         respx.get(f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}").mock(
@@ -43,7 +44,8 @@ def test_fanout_ok():
 
 def test_fk_check_review_user_missing():
     with respx.mock:
-        respx.get(f"{SPOT_SERVICE_URL}/spots/s1").mock(
+        # **FIX:** Changed /spots/s1 to /studyspots/s1
+        respx.get(f"{SPOT_SERVICE_URL}/studyspots/s1").mock(
             return_value=httpx.Response(200, json={"id": "s1"})
         )
         respx.get(f"{USER_SERVICE_URL}/users/u-missing").mock(
