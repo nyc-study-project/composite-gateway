@@ -303,7 +303,6 @@ async def proxy_get_user(user_id: str, response: Response) -> Any:
 # ---------------------------------------------------------------------------
 # FK-validated review creation
 # ---------------------------------------------------------------------------
-
 @app.post("/api/reviews", tags=["composite"])
 async def create_review_with_fk_check(
     payload: Dict[str, Any] = Body(...),
@@ -362,9 +361,9 @@ async def create_review_with_fk_check(
                 detail=user_resp.text,
             )
 
-        # Both exist → create the review
+        # Both exist → create the review in Reviews service
         create_resp = await client.post(
-            f"{REVIEWS_SERVICE_URL}/reviews",
+            f"{REVIEWS_SERVICE_URL}/review/{spot_id}/user/{user_id}",
             json=payload,
             timeout=DEFAULT_TIMEOUT,
         )
@@ -376,6 +375,7 @@ async def create_review_with_fk_check(
         return create_resp.json()
     except ValueError:
         return {"detail": f"Reviews service returned non-JSON: {create_resp.text}"}
+
 
 
 # ---------------------------------------------------------------------------
