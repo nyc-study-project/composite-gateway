@@ -296,7 +296,4 @@ curl "https://composite-gateway-642518168067.us-east1.run.app/api/tasks/<job_id>
 | Polling Endpoint    | ✔ Done |
 | Docs                | ✔ Done |
 
-Everything for Composite Gateway is now complete.
 
-✅ A separate CONTRIBUTING.md
-Just say the word.
