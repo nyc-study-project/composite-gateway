@@ -76,25 +76,52 @@ async def root():
     return {"message": "Welcome to the Composite Gateway API. See /docs."}
 
 # ---------- Composite endpoint ----------
-
 @app.get("/composite/spots/{spot_id}/full", tags=["composite"])
 async def get_spot_full(spot_id: str):
     async with AsyncClient() as client:
         try:
             spot_task = _get_json(client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}")
-            reviews_task = _safe_get_reviews(client, f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}")
+            reviews_task = _safe_get_reviews(
+                client,
+                f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}",
+            )
             users_task = _get_json(client, f"{USER_SERVICE_URL}/users")
 
-            spot_raw, reviews, users = await asyncio.gather(
+            spot_raw, reviews_raw, users_raw = await asyncio.gather(
                 spot_task, reviews_task, users_task
             )
 
         except HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
+            )
         except RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Downstream error: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Downstream error: {e}",
+            )
 
-    spot = spot_raw.get("data", spot_raw)
+    # ----- Normalize shapes so the frontend gets what it expects -----
+
+    # Spot: unwrap { "data": { ... } } → { ... }
+    spot = spot_raw.get("data", spot_raw) if isinstance(spot_raw, dict) else spot_raw
+
+    # Reviews: unwrap { "data": [ ... ] } → [ ... ]
+    if isinstance(reviews_raw, dict):
+        reviews = reviews_raw.get("data", [])
+    elif isinstance(reviews_raw, list):
+        reviews = reviews_raw
+    else:
+        reviews = []
+
+    # Users: if user service also wraps in data, unwrap similarly
+    if isinstance(users_raw, dict):
+        users = users_raw.get("data", [])
+    elif isinstance(users_raw, list):
+        users = users_raw
+    else:
+        users = []
 
     return {
         "spot": spot,
