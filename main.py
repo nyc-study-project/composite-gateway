@@ -51,14 +51,55 @@ async def _get_json(client: AsyncClient, url: str):
     return resp.json()
 
 
-async def _safe_get_reviews(client: AsyncClient, url: str):
-    resp = await client.get(url, timeout=DEFAULT_TIMEOUT)
+async def _get_reviews_for_spot(client: AsyncClient, spot_id: str):
+    """
+    Call Reviews service GET /reviews/{spotId} and normalize into a flat list.
+
+    Reviews service response shape (per OpenAPI example):
+
+    [
+      {
+        "data": {
+          "id": "...",
+          "postDate": "...",
+          "review": "...",
+          "created_at": "...",
+          "updated_at": "..."
+        },
+        "links": [...]
+      },
+      ...
+    ]
+    """
+    resp = await client.get(
+        f"{REVIEWS_SERVICE_URL}/reviews/{spot_id}",
+        timeout=DEFAULT_TIMEOUT,
+    )
 
     if resp.status_code == 404:
+        # No reviews for this spot yet
         return []
 
     resp.raise_for_status()
-    return resp.json()
+    raw = resp.json()
+
+    # Normalize: array of review dicts
+    normalized = []
+    if isinstance(raw, list):
+        for item in raw:
+            d = item.get("data", item)
+            normalized.append({
+                "id": d.get("id"),
+                "spot_id": spot_id,
+                "user_id": d.get("userId"),   # may be None if not present
+                "review": d.get("review"),
+                "post_date": d.get("postDate") or d.get("created_at"),
+                "created_at": d.get("created_at"),
+                "updated_at": d.get("updated_at"),
+            })
+
+    return normalized
+
 
 # ---------- Basic endpoints ----------
 
@@ -80,54 +121,29 @@ async def root():
 async def get_spot_full(spot_id: str):
     async with AsyncClient() as client:
         try:
-            spot_task = _get_json(client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}")
-            reviews_task = _safe_get_reviews(
-                client,
-                f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}",
+            spot_task = _get_json(
+                client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}"
             )
+            reviews_task = _get_reviews_for_spot(client, spot_id)
             users_task = _get_json(client, f"{USER_SERVICE_URL}/users")
 
-            spot_raw, reviews_raw, users_raw = await asyncio.gather(
+            spot_raw, reviews, users = await asyncio.gather(
                 spot_task, reviews_task, users_task
             )
 
         except HTTPStatusError as e:
-            raise HTTPException(
-                status_code=e.response.status_code,
-                detail=e.response.text,
-            )
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
         except RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Downstream error: {e}",
-            )
+            raise HTTPException(status_code=502, detail=f"Downstream error: {e}")
 
-    # ----- Normalize shapes so the frontend gets what it expects -----
-
-    # Spot: unwrap { "data": { ... } } → { ... }
-    spot = spot_raw.get("data", spot_raw) if isinstance(spot_raw, dict) else spot_raw
-
-    # Reviews: unwrap { "data": [ ... ] } → [ ... ]
-    if isinstance(reviews_raw, dict):
-        reviews = reviews_raw.get("data", [])
-    elif isinstance(reviews_raw, list):
-        reviews = reviews_raw
-    else:
-        reviews = []
-
-    # Users: if user service also wraps in data, unwrap similarly
-    if isinstance(users_raw, dict):
-        users = users_raw.get("data", [])
-    elif isinstance(users_raw, list):
-        users = users_raw
-    else:
-        users = []
+    spot = spot_raw.get("data", spot_raw)
 
     return {
         "spot": spot,
         "reviews": reviews,
         "users": users,
     }
+
 
 # ---------- Proxy endpoints ----------
 
