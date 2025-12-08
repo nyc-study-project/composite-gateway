@@ -3,24 +3,23 @@ from __future__ import annotations
 import os
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Body, Response, Query
+from fastapi import FastAPI, HTTPException, Body, Response
+from fastapi.middleware.cors import CORSMiddleware
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ---------- Config ----------
 
 COMPOSITE_SERVICE_NAME = "Composite Gateway"
 
-# For local dev these default to localhost ports.
-# In Cloud Run you override them with env vars.
-USER_SERVICE_URL = os.getenv("USER_SERVICE_URL", "http://localhost:8001")
-SPOT_SERVICE_URL = os.getenv("SPOT_SERVICE_URL", "http://localhost:8002")
-REVIEWS_SERVICE_URL = os.getenv("REVIEWS_SERVICE_URL", "http://localhost:8003")
+USER_SERVICE_URL    = "http://34.139.134.144:8002"
+SPOT_SERVICE_URL    = "https://spot-management-642518168067.us-east1.run.app"
+REVIEWS_SERVICE_URL = "https://reviews-api-c73xxvyjwq-ue.a.run.app"
 
 DEFAULT_TIMEOUT = 5.0  # seconds
+
+# ---------- FastAPI app ----------
 
 app = FastAPI(
     title="Composite Gateway Service",
@@ -34,136 +33,67 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# ---------- CORS ----------
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # change to your frontend URL in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def _get_json(client: AsyncClient, url: str) -> Any:
-    """
-    Helper: GET a URL and return JSON or raise HTTPStatusError.
-    Network errors are surfaced as RequestError and handled by callers.
-    """
+# ---------- Helpers ----------
+
+async def _get_json(client: AsyncClient, url: str):
     resp = await client.get(url, timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 
-async def _safe_get_reviews(client: AsyncClient, url: str) -> List[Dict[str, Any]]:
-    """
-    GET reviews for a spot.
-
-    - If the Reviews service returns 404, treat that as "no reviews yet" and return [].
-    - For any other 4xx/5xx, raise HTTPException so the caller can decide.
-    """
-    try:
-        resp = await client.get(url, timeout=DEFAULT_TIMEOUT)
-    except RequestError as e:
-        # Network-level failure reaching reviews service
-        raise HTTPException(
-            status_code=502,
-            detail=f"Reviews service unreachable: {e}",
-        ) from e
+async def _safe_get_reviews(client: AsyncClient, url: str):
+    resp = await client.get(url, timeout=DEFAULT_TIMEOUT)
 
     if resp.status_code == 404:
-        # Interpret "not found" as "no reviews yet" for aggregation purposes
         return []
 
-    try:
-        resp.raise_for_status()
-    except HTTPStatusError as e:
-        # Bubble up the underlying HTTP error from the reviews service
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=e.response.text,
-        ) from e
+    resp.raise_for_status()
+    return resp.json()
 
-    data = resp.json()
-    # If your reviews service wraps responses like {"data": [...]}, normalize here:
-    # return data.get("data", [])
-    return data  # assuming it's already a list
-
-
-# ---------------------------------------------------------------------------
-# Basic/internal endpoints
-# ---------------------------------------------------------------------------
+# ---------- Basic endpoints ----------
 
 @app.get("/health", tags=["internal"])
-async def health() -> Dict[str, Any]:
+async def health():
     return {
         "status": "ok",
         "service": COMPOSITE_SERVICE_NAME,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "upstreams": {
-            "USER_SERVICE_URL": USER_SERVICE_URL,
-            "SPOT_SERVICE_URL": SPOT_SERVICE_URL,
-            "REVIEWS_SERVICE_URL": REVIEWS_SERVICE_URL,
-        },
     }
 
 
 @app.get("/", tags=["internal"])
-async def root() -> Dict[str, str]:
-    return {
-        "message": "Welcome to the Composite Gateway API. See /docs for OpenAPI UI."
-    }
+async def root():
+    return {"message": "Welcome to the Composite Gateway API. See /docs."}
 
-
-# ---------------------------------------------------------------------------
-# Composite endpoint (parallel fan-out)
-# ---------------------------------------------------------------------------
+# ---------- Composite endpoint ----------
 
 @app.get("/composite/spots/{spot_id}/full", tags=["composite"])
-async def get_spot_full(spot_id: str) -> Dict[str, Any]:
-    """
-    Composite endpoint that aggregates data from all three microservices.
-
-    - Spot service:    GET {SPOT_SERVICE_URL}/studyspots/{spot_id}
-    - Reviews service: GET {REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}
-                       (404 => no reviews, returns [])
-    - User service:    GET {USER_SERVICE_URL}/users
-                       (returns list of user profiles)
-
-    Response shape:
-
-    {
-      "spot":    { ... },   # single spot object (normalized from Spot service)
-      "reviews": [ ... ],   # list of reviews (may be empty)
-      "users":   [ ... ]    # list of users (may be empty)
-    }
-    """
+async def get_spot_full(spot_id: str):
     async with AsyncClient() as client:
         try:
-            spot_task = _get_json(
-                client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}"
-            )
-            reviews_task = _safe_get_reviews(
-                client, f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}"
-            )
-            users_task = _get_json(
-                client, f"{USER_SERVICE_URL}/users"
-            )
+            spot_task = _get_json(client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}")
+            reviews_task = _safe_get_reviews(client, f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}")
+            users_task = _get_json(client, f"{USER_SERVICE_URL}/users")
 
             spot_raw, reviews, users = await asyncio.gather(
                 spot_task, reviews_task, users_task
             )
 
         except HTTPStatusError as e:
-            # For non-404 errors from Spot/User (since Reviews handled above),
-            # bubble up their status codes and messages.
-            raise HTTPException(
-                status_code=e.response.status_code,
-                detail=e.response.text,
-            ) from e
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
         except RequestError as e:
-            # Network, DNS, or connection-level issues reaching downstream services
-            raise HTTPException(
-                status_code=502,
-                detail=f"Downstream request error: {e}",
-            ) from e
+            raise HTTPException(status_code=502, detail=f"Downstream error: {e}")
 
-    # Spot service currently returns {"data": {...}, "links": [...]}
-    # Normalize so composite response has just the spot object.
     spot = spot_raw.get("data", spot_raw)
 
     return {
@@ -172,75 +102,31 @@ async def get_spot_full(spot_id: str) -> Dict[str, Any]:
         "users": users,
     }
 
-
-# ---------------------------------------------------------------------------
-# Facade / proxy endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/api/spots", tags=["proxy"])
-async def proxy_list_spots(
-    response: Response,
-    limit: Optional[int] = Query(None),
-    offset: Optional[int] = Query(None),
-) -> Any:
-    """
-    Proxy for listing study spots, mirroring Spot service (if it supports paging).
-
-    Example mapping:
-      GET /api/spots?limit=10&offset=0 ->
-      GET {SPOT_SERVICE_URL}/studyspots?limit=10&offset=0
-    """
-    params = {}
-    if limit is not None:
-        params["limit"] = limit
-    if offset is not None:
-        params["offset"] = offset
-
-    async with AsyncClient() as client:
-        resp = await client.get(
-            f"{SPOT_SERVICE_URL}/studyspots",
-            params=params,
-            timeout=DEFAULT_TIMEOUT,
-        )
-
-    response.status_code = resp.status_code
-    etag = resp.headers.get("etag")
-    if etag:
-        response.headers["ETag"] = etag
-    return resp.json()
-
+# ---------- Proxy endpoints ----------
 
 @app.get("/api/spots/{spot_id}", tags=["proxy"])
-async def proxy_get_spot(spot_id: str, response: Response) -> Any:
-    """
-    Facade that proxies GET studyspot by ID to the Spot service.
-    Also forwards the ETag header so clients can do conditional requests.
-    """
+async def proxy_get_spot(spot_id: str, response: Response):
     async with AsyncClient() as client:
         resp = await client.get(
             f"{SPOT_SERVICE_URL}/studyspots/{spot_id}",
-            timeout=DEFAULT_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT
         )
 
     response.status_code = resp.status_code
     etag = resp.headers.get("etag")
     if etag:
         response.headers["ETag"] = etag
+
     return resp.json()
 
 
 @app.get("/api/reviews", tags=["proxy"])
 async def proxy_list_reviews(
-    response: Response,
     spot_id: Optional[str] = None,
-) -> Any:
-    """
-    Facade for listing reviews.
-
-    Optional query:
-      - /api/reviews?spot_id={id} to filter by studyspot.
-    """
+    response: Response = None,
+):
     query = f"?spot_id={spot_id}" if spot_id else ""
+
     async with AsyncClient() as client:
         resp = await client.get(
             f"{REVIEWS_SERVICE_URL}/reviews{query}",
@@ -251,35 +137,8 @@ async def proxy_list_reviews(
     return resp.json()
 
 
-@app.get("/api/users", tags=["proxy"])
-async def proxy_list_users(response: Response) -> Any:
-    """
-    Facade that proxies GET /users (list) to the User service.
-    """
-    async with AsyncClient() as client:
-        try:
-            resp = await client.get(
-                f"{USER_SERVICE_URL}/users",
-                timeout=DEFAULT_TIMEOUT,
-            )
-        except RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"User service unreachable: {e}",
-            ) from e
-
-    response.status_code = resp.status_code
-    try:
-        return resp.json()
-    except ValueError:
-        return {"detail": f"User service returned non-JSON: {resp.text}"}
-
-
 @app.get("/api/users/{user_id}", tags=["proxy"])
-async def proxy_get_user(user_id: str, response: Response) -> Any:
-    """
-    Facade that proxies GET user by ID to the User service.
-    """
+async def proxy_get_user(user_id: str, response: Response):
     async with AsyncClient() as client:
         try:
             resp = await client.get(
@@ -287,64 +146,51 @@ async def proxy_get_user(user_id: str, response: Response) -> Any:
                 timeout=DEFAULT_TIMEOUT,
             )
         except RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"User service unreachable: {e}",
-            ) from e
+            raise HTTPException(status_code=502, detail=f"User service error: {e}")
 
     response.status_code = resp.status_code
 
     try:
         return resp.json()
     except ValueError:
-        return {"detail": f"User service returned non-JSON: {resp.text}"}
+        return {"detail": resp.text}
 
+# ---------- Review w/ FK validation ----------
 
-# ---------------------------------------------------------------------------
-# FK-validated review creation
-# ---------------------------------------------------------------------------
+# ---------- Review w/ FK validation ----------
 @app.post("/api/reviews", tags=["composite"])
 async def create_review_with_fk_check(
-    payload: Dict[str, Any] = Body(...),
+    payload: dict = Body(...),
     response: Response = None,
-) -> Any:
+):
     """
-    Create a review, but first validate that the referenced spot_id and user_id exist.
+    Composite FK-validation for creating a review.
 
-    Steps:
-      1. Check payload has spot_id and user_id.
-      2. GET Spot and User from their respective services.
-      3. If both exist, forward POST to reviews service.
+    - Accepts: {spot_id, user_id, rating, comment}
+    - Validates that spot + user exist via Spot/User services
+    - Translates to Reviews API shape and calls:
+        POST /review/{spotId}/user/{userId}
+      with body: {postDate, review}
     """
     spot_id = payload.get("spot_id")
     user_id = payload.get("user_id")
 
     if not spot_id or not user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="spot_id and user_id are required",
-        )
+        raise HTTPException(status_code=400, detail="spot_id and user_id required")
 
     async with AsyncClient() as client:
-        # Parallel FK validation calls
-        try:
-            spot_resp, user_resp = await asyncio.gather(
-                client.get(
-                    f"{SPOT_SERVICE_URL}/studyspots/{spot_id}",
-                    timeout=DEFAULT_TIMEOUT,
-                ),
-                client.get(
-                    f"{USER_SERVICE_URL}/users/{user_id}",
-                    timeout=DEFAULT_TIMEOUT,
-                ),
-            )
-        except RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Downstream FK validation error: {e}",
-            ) from e
+        # 1) Parallel FK checks
+        spot_resp, user_resp = await asyncio.gather(
+            client.get(
+                f"{SPOT_SERVICE_URL}/studyspots/{spot_id}",
+                timeout=DEFAULT_TIMEOUT,
+            ),
+            client.get(
+                f"{USER_SERVICE_URL}/users/{user_id}",
+                timeout=DEFAULT_TIMEOUT,
+            ),
+        )
 
-        # FK existence checks
         if spot_resp.status_code == 404:
             raise HTTPException(status_code=404, detail="Spot not found")
         if user_resp.status_code == 404:
@@ -361,103 +207,68 @@ async def create_review_with_fk_check(
                 detail=user_resp.text,
             )
 
-        # Both exist → create the review in Reviews service
+        # 2) Map composite payload -> Reviews microservice schema
+        review_payload = {
+            # If caller doesn’t send postDate, use "now"
+            "postDate": payload.get("postDate")
+            or datetime.now(timezone.utc).isoformat(),
+            # Use comment as the review text
+            "review": payload.get("comment") or payload.get("review") or "",
+        }
+
+        # 3) Call the real Reviews endpoint:
+        #    POST /review/{spotId}/user/{userId}
         create_resp = await client.post(
             f"{REVIEWS_SERVICE_URL}/review/{spot_id}/user/{user_id}",
-            json=payload,
+            json=review_payload,
             timeout=DEFAULT_TIMEOUT,
         )
 
-    if response is not None:
-        response.status_code = create_resp.status_code
-
+    response.status_code = create_resp.status_code
     try:
         return create_resp.json()
     except ValueError:
-        return {"detail": f"Reviews service returned non-JSON: {create_resp.text}"}
+        # fallback if reviews service ever returns non-JSON
+        return {"detail": create_resp.text}
 
-
-
-# ---------------------------------------------------------------------------
-# Async geocode 202 + polling (proxying Spot service jobs)
-# ---------------------------------------------------------------------------
+# ---------- Async geocode endpoints ----------
 
 @app.post("/api/spots/{spot_id}/geocode", tags=["async"])
-async def start_geocode_job(spot_id: str, response: Response) -> Any:
-    """
-    Start an asynchronous geocoding job for a studyspot.
-
-    Proxies to:
-      POST {SPOT_SERVICE_URL}/studyspots/{spot_id}/geocode
-
-    If Spot service returns:
-      { "message": "...", "job_id": "..." } with 202 + Location: /jobs/{job_id}
-
-    This endpoint:
-      - returns same body
-      - rewrites Location to /api/tasks/{job_id} so clients stay on Composite
-    """
+async def start_geocode_job(spot_id: str, response: Response):
     async with AsyncClient() as client:
-        try:
-            resp = await client.post(
-                f"{SPOT_SERVICE_URL}/studyspots/{spot_id}/geocode",
-                timeout=DEFAULT_TIMEOUT,
-            )
-        except RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Spot service unreachable for geocode job: {e}",
-            ) from e
+        resp = await client.post(
+            f"{SPOT_SERVICE_URL}/studyspots/{spot_id}/geocode",
+            timeout=DEFAULT_TIMEOUT,
+        )
 
     response.status_code = resp.status_code
 
     try:
         job_json = resp.json()
     except ValueError:
-        return {"detail": f"Unexpected response from Spot service: {resp.text}"}
+        return {"detail": f"Unexpected response: {resp.text}"}
 
     job_id = job_json.get("job_id") or job_json.get("id")
-
     if job_id:
-        # Rewrite Location so clients only talk to composite
         response.headers["Location"] = f"/api/tasks/{job_id}"
 
     return job_json
 
 
 @app.get("/api/tasks/{task_id}", tags=["async"])
-async def get_task_status(task_id: str, response: Response) -> Any:
-    """
-    Poll the status of an async geocode job.
-
-    Proxies to:
-      GET {SPOT_SERVICE_URL}/jobs/{task_id}
-    """
+async def get_task_status(task_id: str, response: Response):
     async with AsyncClient() as client:
-        try:
-            resp = await client.get(
-                f"{SPOT_SERVICE_URL}/jobs/{task_id}",
-                timeout=DEFAULT_TIMEOUT,
-            )
-        except RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Spot service unreachable for task status: {e}",
-            ) from e
+        resp = await client.get(
+            f"{SPOT_SERVICE_URL}/jobs/{task_id}",
+            timeout=DEFAULT_TIMEOUT,
+        )
 
     response.status_code = resp.status_code
-    try:
-        return resp.json()
-    except ValueError:
-        return {"detail": f"Spot service returned non-JSON: {resp.text}"}
+    return resp.json()
 
-
-# ---------------------------------------------------------------------------
-# Local dev entrypoint
-# ---------------------------------------------------------------------------
+# ---------- Local entrypoint ----------
 
 if __name__ == "__main__":
     import uvicorn
-
-    port = int(os.environ.get("FASTAPIPORT", "8000"))
+    port = int(os.environ.get("FASTAPIPORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
