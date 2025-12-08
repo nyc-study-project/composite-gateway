@@ -121,14 +121,14 @@ async def root():
 async def get_spot_full(spot_id: str):
     async with AsyncClient() as client:
         try:
-            spot_task = _get_json(
-                client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}"
-            )
+            spot_task = _get_json(client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}")
             reviews_task = _get_reviews_for_spot(client, spot_id)
             users_task = _get_json(client, f"{USER_SERVICE_URL}/users")
+            ratings_task = _get_ratings_for_spot(client, spot_id)
+            avg_task = _get_average_rating_for_spot(client, spot_id)
 
-            spot_raw, reviews, users = await asyncio.gather(
-                spot_task, reviews_task, users_task
+            spot_raw, reviews, users, ratings, rating_summary = await asyncio.gather(
+                spot_task, reviews_task, users_task, ratings_task, avg_task
             )
 
         except HTTPStatusError as e:
@@ -138,10 +138,20 @@ async def get_spot_full(spot_id: str):
 
     spot = spot_raw.get("data", spot_raw)
 
+    # Optional: attach rating to each review (best-effort, assuming ratings carry userId)
+    ratings_by_user = {
+        r["user_id"]: r for r in ratings if r.get("user_id") is not None
+    }
+    for r in reviews:
+        uid = r.get("user_id")
+        if uid in ratings_by_user:
+            r["rating"] = ratings_by_user[uid]["rating"]
+
     return {
         "spot": spot,
         "reviews": reviews,
         "users": users,
+        "rating_summary": rating_summary,
     }
 
 
@@ -206,32 +216,19 @@ async def create_review_with_fk_check(
     payload: dict = Body(...),
     response: Response = None,
 ):
-    """
-    Composite FK-validation for creating a review.
-
-    - Accepts: {spot_id, user_id, rating, comment}
-    - Validates that spot + user exist via Spot/User services
-    - Translates to Reviews API shape and calls:
-        POST /review/{spotId}/user/{userId}
-      with body: {postDate, review}
-    """
     spot_id = payload.get("spot_id")
     user_id = payload.get("user_id")
 
     if not spot_id or not user_id:
         raise HTTPException(status_code=400, detail="spot_id and user_id required")
 
+    rating_value = payload.get("rating")
+
     async with AsyncClient() as client:
         # 1) Parallel FK checks
         spot_resp, user_resp = await asyncio.gather(
-            client.get(
-                f"{SPOT_SERVICE_URL}/studyspots/{spot_id}",
-                timeout=DEFAULT_TIMEOUT,
-            ),
-            client.get(
-                f"{USER_SERVICE_URL}/users/{user_id}",
-                timeout=DEFAULT_TIMEOUT,
-            ),
+            client.get(f"{SPOT_SERVICE_URL}/studyspots/{spot_id}", timeout=DEFAULT_TIMEOUT),
+            client.get(f"{USER_SERVICE_URL}/users/{user_id}", timeout=DEFAULT_TIMEOUT),
         )
 
         if spot_resp.status_code == 404:
@@ -240,39 +237,104 @@ async def create_review_with_fk_check(
             raise HTTPException(status_code=404, detail="User not found")
 
         if spot_resp.status_code >= 400:
-            raise HTTPException(
-                status_code=spot_resp.status_code,
-                detail=spot_resp.text,
-            )
+            raise HTTPException(status_code=spot_resp.status_code, detail=spot_resp.text)
         if user_resp.status_code >= 400:
-            raise HTTPException(
-                status_code=user_resp.status_code,
-                detail=user_resp.text,
-            )
+            raise HTTPException(status_code=user_resp.status_code, detail=user_resp.text)
 
-        # 2) Map composite payload -> Reviews microservice schema
+        # 2) Create review
+        now_iso = datetime.now(timezone.utc).isoformat()
         review_payload = {
-            # If caller doesn’t send postDate, use "now"
-            "postDate": payload.get("postDate")
-            or datetime.now(timezone.utc).isoformat(),
-            # Use comment as the review text
+            "postDate": payload.get("postDate") or now_iso,
             "review": payload.get("comment") or payload.get("review") or "",
         }
 
-        # 3) Call the real Reviews endpoint:
-        #    POST /review/{spotId}/user/{userId}
-        create_resp = await client.post(
+        review_resp = await client.post(
             f"{REVIEWS_SERVICE_URL}/review/{spot_id}/user/{user_id}",
             json=review_payload,
             timeout=DEFAULT_TIMEOUT,
         )
 
-    response.status_code = create_resp.status_code
+        # 3) Optionally create rating if provided
+        rating_resp_json = None
+        if rating_value is not None:
+            rating_payload = {
+                "postDate": now_iso,
+                "rating": int(rating_value),
+            }
+            rating_resp = await client.post(
+                f"{REVIEWS_SERVICE_URL}/rating/{spot_id}/user/{user_id}",
+                json=rating_payload,
+                timeout=DEFAULT_TIMEOUT,
+            )
+            try:
+                rating_resp_json = rating_resp.json()
+            except ValueError:
+                rating_resp_json = {"detail": rating_resp.text}
+
+    response.status_code = review_resp.status_code
     try:
-        return create_resp.json()
+        review_json = review_resp.json()
     except ValueError:
-        # fallback if reviews service ever returns non-JSON
-        return {"detail": create_resp.text}
+        review_json = {"detail": review_resp.text}
+
+    # Return both pieces so you can see them in Swagger if you want
+    return {
+        "review": review_json,
+        "rating": rating_resp_json,
+    }
+
+
+
+async def _get_ratings_for_spot(client: AsyncClient, spot_id: str):
+    resp = await client.get(
+        f"{REVIEWS_SERVICE_URL}/ratings/{spot_id}",
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    if resp.status_code == 404:
+        return []
+
+    resp.raise_for_status()
+    raw = resp.json()
+
+    # Expecting: list of { "data": { "id", "postDate", "rating", ... }, "links": [...] }
+    ratings = []
+    if isinstance(raw, list):
+        for item in raw:
+            d = item.get("data", item)
+            ratings.append(
+                {
+                    "id": d.get("id"),
+                    "rating": d.get("rating"),
+                    "post_date": d.get("postDate") or d.get("created_at"),
+                    "created_at": d.get("created_at"),
+                    "updated_at": d.get("updated_at"),
+                    # include userId if your API returns it:
+                    "user_id": d.get("userId"),
+                }
+            )
+    return ratings
+
+
+async def _get_average_rating_for_spot(client: AsyncClient, spot_id: str):
+    resp = await client.get(
+        f"{REVIEWS_SERVICE_URL}/ratings/{spot_id}/average",
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    if resp.status_code == 404:
+        return None
+
+    resp.raise_for_status()
+    raw = resp.json()
+
+    # Example: { "data": { "average_rating": 4, "rating_count": 2, "spotId": "..." }, "links": [...] }
+    data = raw.get("data", raw)
+    return {
+        "average_rating": data.get("average_rating"),
+        "rating_count": data.get("rating_count"),
+        "spot_id": data.get("spotId") or spot_id,
+    }
 
 # ---------- Async geocode endpoints ----------
 
