@@ -8,3 +8,4 @@ annotated-types==0.7.0
 # test deps for CI
 pytest==9.0.1
 respx==0.21.1
+google-cloud-pubsub

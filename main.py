@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import asyncio
 import json
+import httpx
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Body, Response
+from fastapi import FastAPI, HTTPException, Body, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
@@ -352,17 +353,45 @@ async def get_task_status(task_id: str, response: Response):
 async def google_oauth_callback(request: Request, response: Response):
     """
     Proxy endpoint that forwards the Google OAuth callback request to the User Management service.
-    This will be used to handle the redirect URI issue when the User Management service is on a VM with an IP.
     """
-    user_management_url = "http://34.139.134.144:8002/auth/callback/google"  # your User Management service callback URL
+    user_management_url = "http://34.139.134.144:8002/auth/callback/google"
+    
     async with httpx.AsyncClient() as client:
-        resp = await client.get(user_management_url, params=request.query_params)
+        # Pass cookies from the browser (request.cookies) to the VM
+        resp = await client.get(
+            user_management_url, 
+            params=request.query_params, 
+            cookies=request.cookies  # <--- THIS IS THE FIX
+        )
+        
         response.status_code = resp.status_code
-        response.headers.update(resp.headers)
+        
+        # Pass headers (including Set-Cookie) back to the browser
+        for key, value in resp.headers.items():
+            if key.lower() not in ["content-length", "content-encoding"]:
+                response.headers[key] = value
+                
         return resp.text
 
-
-# ---------- Local entrypoint (for dev) ----------
+@app.get("/auth/login/google", tags=["proxy"])
+async def google_oauth_login(request: Request, response: Response):
+    user_management_url = "http://34.139.134.144:8002/auth/login/google" 
+    async with httpx.AsyncClient() as client:
+        # 1. Capture the Redirect + Set-Cookie from VM
+        resp = await client.get(
+            user_management_url, 
+            params=request.query_params, 
+            follow_redirects=False
+        )
+        
+        response.status_code = resp.status_code
+        
+        # 2. CAREFULLY copy headers to ensure Set-Cookie survives
+        for key, value in resp.headers.items():
+            if key.lower() not in ["content-length", "content-encoding"]:
+                response.headers[key] = value
+                
+        return resp.content
 
 if __name__ == "__main__":
     import uvicorn
