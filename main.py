@@ -208,6 +208,20 @@ async def proxy_get_user(user_id: str, response: Response):
     except ValueError:
         return {"detail": resp.text}
 
+
+@app.get("/auth/callback/google", tags=["proxy"])
+async def google_oauth_callback(request: Request, response: Response):
+    """
+    Proxy endpoint that forwards the Google OAuth callback request to the User Management service.
+    This will be used to handle the redirect URI issue when the User Management service is on a VM with an IP.
+    """
+    user_management_url = "http://34.139.134.144:8002/auth/callback/google"  # your User Management service callback URL
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(user_management_url, params=request.query_params)
+        response.status_code = resp.status_code
+        response.headers.update(resp.headers)
+        return resp.text
+
 # ---------- Review w/ FK validation ----------
 
 # ---------- Review w/ FK validation ----------
