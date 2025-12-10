@@ -393,8 +393,8 @@ async def google_oauth_login(request: Request, response: Response):
                 
         return resp.content
 
-if __name__ == "__main__":
-    import uvicorn
+#if __name__ == "__main__":
+    #import uvicorn
 
-    port = int(os.environ.get("FASTAPIPORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    #port = int(os.environ.get("FASTAPIPORT", 8000))
+    #uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
