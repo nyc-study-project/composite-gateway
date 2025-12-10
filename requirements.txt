@@ -9,3 +9,4 @@ annotated-types==0.7.0
 pytest==9.0.1
 respx==0.21.1
 google-cloud-pubsub
+itsdangerous>=2.1.2
