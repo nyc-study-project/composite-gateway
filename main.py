@@ -354,6 +354,7 @@ async def google_oauth_callback(request: Request, response: Response):
     """
     Proxy endpoint that forwards the Google OAuth callback request to the User Management service.
     """
+    print("COOKIES RECEIVED:", request.cookies)
     user_management_url = "http://34.139.134.144:8002/auth/callback/google"
     
     async with httpx.AsyncClient() as client:
