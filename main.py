@@ -162,7 +162,8 @@ async def get_spot_full(spot_id: str):
 
 
 @app.get("/api/spots/{spot_id}", tags=["proxy"])
-async def proxy_get_spot(spot_id: str, response: Response):
+async def proxy_get_spot_api(spot_id: str, response: Response):
+    """Proxy for the /api/spots/{spot_id} route."""
     async with AsyncClient() as client:
         resp = await client.get(
             f"{SPOT_SERVICE_URL}/studyspots/{spot_id}", timeout=DEFAULT_TIMEOUT
@@ -177,6 +178,34 @@ async def proxy_get_spot(spot_id: str, response: Response):
         return resp.json()
     except ValueError:
         return {"detail": resp.text}
+
+# -------------------------------------------------------------
+# *** NEW ROUTE ADDED HERE TO FIX FRONTEND 404 ***
+# -------------------------------------------------------------
+
+@app.get("/spots/{spot_id}", tags=["proxy"])
+async def proxy_get_spot_simple(spot_id: str, response: Response):
+    """
+    Simple proxy for the frontend to fetch spot details via /spots/{spot_id}.
+    This route handles the likely path requested by the frontend when clicking 'Details'.
+    It proxies the request to the Spot Management Service's /studyspots endpoint.
+    """
+    async with AsyncClient() as client:
+        resp = await client.get(
+            f"{SPOT_SERVICE_URL}/studyspots/{spot_id}", timeout=DEFAULT_TIMEOUT
+        )
+
+    response.status_code = resp.status_code
+    etag = resp.headers.get("etag")
+    if etag:
+        response.headers["ETag"] = etag
+
+    try:
+        return resp.json()
+    except ValueError:
+        return {"detail": resp.text}
+        
+# -------------------------------------------------------------
 
 
 @app.get("/api/reviews", tags=["proxy"])
@@ -234,8 +263,8 @@ async def create_review_with_fk_check(
     - Accepts: {spot_id, user_id, rating, comment}
     - Validates that spot + user exist (spot + user services)
     - Translates to Reviews API schema:
-        POST /review/{spotId}/user/{userId}
-      with body: {postDate, review}
+          POST /review/{spotId}/user/{userId}
+        with body: {postDate, review}
     - Emits Pub/Sub event "review_created" for Cloud Run listener.
     """
     spot_id = payload.get("spot_id")
