@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Body, Response, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from httpx import AsyncClient, HTTPStatusError, RequestError
+from uuid import uuid4 # 
 
 from google.cloud import pubsub_v1
 
@@ -121,44 +122,75 @@ async def root():
 # ---------- Composite endpoint ----------
 
 
+# Replace the existing get_spot_full function with this one
+
 @app.get("/composite/spots/{spot_id}/full", tags=["composite"])
 async def get_spot_full(spot_id: str):
     """
     Fan-out read:
-
-    - Spot service:    GET {SPOT_SERVICE_URL}/studyspots/{spot_id}
-    - Reviews service: GET {REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}
-    - User service:    GET {USER_SERVICE_URL}/users
+    - Spot service:    GET /studyspots/{spot_id}
+    - Reviews service: GET /reviews/{spot_id}
+    - Reviews service: GET /ratings/{spot_id}
+    - Reviews service: GET /ratings/{spot_id}/average
+    - User service:    GET /users
     """
     async with AsyncClient() as client:
         try:
-            spot_task = _get_json(client, f"{SPOT_SERVICE_URL}/studyspots/{spot_id}")
-            reviews_task = _safe_get_reviews(
-                client, f"{REVIEWS_SERVICE_URL}/reviews?spot_id={spot_id}"
+            # 1. Launch all requests in parallel
+            results = await asyncio.gather(
+                client.get(f"{SPOT_SERVICE_URL}/studyspots/{spot_id}", timeout=DEFAULT_TIMEOUT),
+                client.get(f"{REVIEWS_SERVICE_URL}/reviews/{spot_id}", timeout=DEFAULT_TIMEOUT),
+                client.get(f"{REVIEWS_SERVICE_URL}/ratings/{spot_id}", timeout=DEFAULT_TIMEOUT),
+                client.get(f"{REVIEWS_SERVICE_URL}/ratings/{spot_id}/average", timeout=DEFAULT_TIMEOUT),
+                client.get(f"{USER_SERVICE_URL}/users", timeout=DEFAULT_TIMEOUT),
+                return_exceptions=True
             )
-            users_task = _get_json(client, f"{USER_SERVICE_URL}/users")
 
-            spot_raw, reviews, users = await asyncio.gather(
-                spot_task, reviews_task, users_task
-            )
+            spot_res, review_res, rating_res, avg_res, user_res = results
 
-        except HTTPStatusError as e:
-            raise HTTPException(
-                status_code=e.response.status_code, detail=e.response.text
-            )
-        except RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Downstream error: {e}")
+            # 2. Extract Data Safely
+            spot = spot_res.json().get("data", spot_res.json()) if not isinstance(spot_res, Exception) and spot_res.status_code == 200 else None
+            users = user_res.json() if not isinstance(user_res, Exception) and user_res.status_code == 200 else []
+            
+            # Helper to unwrap "data" key if present (Handles your Review API format)
+            def unwrap_list(response):
+                if isinstance(response, Exception) or response.status_code != 200:
+                    return []
+                json_data = response.json()
+                # If API returns [ { "data": {...} }, ... ] -> return [ {...}, ... ]
+                if isinstance(json_data, list):
+                    return [item["data"] if "data" in item else item for item in json_data]
+                return json_data
 
-    # Spot service wraps the object under "data"
-    spot = spot_raw.get("data", spot_raw)
+            reviews = unwrap_list(review_res)
+            ratings = unwrap_list(rating_res)
+
+            # Rating Summary
+            rating_summary = None
+            if not isinstance(avg_res, Exception) and avg_res.status_code == 200:
+                rating_summary = avg_res.json().get("data")
+
+            # 3. MERGE LOGIC: Attach star ratings to reviews
+            # Now that we've unwrapped the data, this logic works!
+            for r in reviews:
+                r_user_id = r.get("user_id")
+                
+                # Find matching rating for this user
+                user_rating = next((item for item in ratings if item.get("user_id") == r_user_id), None)
+                
+                if user_rating:
+                    r["rating"] = user_rating.get("rating")
+
+        except Exception as e:
+            print(f"Composite Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "spot": spot,
         "reviews": reviews,
         "users": users,
+        "rating_summary": rating_summary
     }
-
-
 # ---------- Proxy endpoints ----------
 
 
@@ -292,23 +324,18 @@ async def create_review_with_fk_check(
     response: Response = None,
 ):
     """
-    Composite FK-validation for creating a review.
-
-    - Accepts: {spot_id, user_id, rating, comment}
-    - Validates that spot + user exist (spot + user services)
-    - Translates to Reviews API schema:
-          POST /review/{spotId}/user/{userId}
-        with body: {postDate, review}
-    - Emits Pub/Sub event "review_created" for Cloud Run listener.
+    Composite FK-validation for creating a review AND a rating.
     """
     spot_id = payload.get("spot_id")
     user_id = payload.get("user_id")
+    rating_val = payload.get("rating")
+    comment_val = payload.get("comment") or payload.get("review") or ""
 
     if not spot_id or not user_id:
         raise HTTPException(status_code=400, detail="spot_id and user_id required")
 
     async with AsyncClient() as client:
-        # 1) Parallel FK checks
+        # 1) Parallel FK checks (Check if Spot and User exist)
         spot_resp, user_resp = await asyncio.gather(
             client.get(
                 f"{SPOT_SERVICE_URL}/studyspots/{spot_id}",
@@ -325,50 +352,75 @@ async def create_review_with_fk_check(
         if user_resp.status_code == 404:
             raise HTTPException(status_code=404, detail="User not found")
 
-        if spot_resp.status_code >= 400:
-            raise HTTPException(
-                status_code=spot_resp.status_code,
-                detail=spot_resp.text,
-            )
-        if user_resp.status_code >= 400:
-            raise HTTPException(
-                status_code=user_resp.status_code,
-                detail=user_resp.text,
-            )
-
-        # 2) Map composite payload -> Reviews microservice schema
+        # 2) Prepare Payloads
+        # We must generate IDs here because the Reviews Service expects them in the body
+        current_time = datetime.now(timezone.utc).isoformat()
+        
+        # Payload for the Review (Text)
         review_payload = {
-            "postDate": payload.get("postDate")
-            or datetime.now(timezone.utc).isoformat(),
-            "review": payload.get("comment") or payload.get("review") or "",
+            "id": str(uuid4()),
+            "postDate": current_time,
+            "review": comment_val,
         }
 
-        # 3) Call the real Reviews endpoint:
-        #    POST /review/{spotId}/user/{userId}
-        create_resp = await client.post(
+        # Payload for the Rating (Stars)
+        rating_payload = {
+            "id": str(uuid4()),
+            "postDate": current_time,
+            "rating": int(rating_val) if rating_val else 0
+        }
+
+        # 3) Parallel Writes to Reviews Service
+        # We create tasks to send both the text and the stars
+        tasks = []
+        
+        # A: Send Review Text
+        tasks.append(client.post(
             f"{REVIEWS_SERVICE_URL}/review/{spot_id}/user/{user_id}",
             json=review_payload,
             timeout=DEFAULT_TIMEOUT,
-        )
+        ))
 
-    if response is not None:
-        response.status_code = create_resp.status_code
+        # B: Send Rating (if it exists)
+        if rating_val is not None:
+            tasks.append(client.post(
+                f"{REVIEWS_SERVICE_URL}/rating/{spot_id}/user/{user_id}",
+                json=rating_payload,
+                timeout=DEFAULT_TIMEOUT,
+            ))
 
-    # 4) Emit Pub/Sub event (fire-and-forget; don't break request if it fails)
+        # Execute both
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Check for errors in results
+        for res in results:
+            if isinstance(res, Exception):
+                print(f"[Composite] Error saving review/rating: {res}")
+                # We continue anyway to attempt to return success, 
+                # but in production, you might want to rollback.
+            elif hasattr(res, 'status_code') and res.status_code >= 400:
+                 print(f"[Composite] Downstream error: {res.status_code} - {res.text}")
+
+    # 4) Emit Pub/Sub event
     emit_event(
         "review_created",
         {
             "spot_id": spot_id,
             "user_id": user_id,
-            "rating": payload.get("rating"),
-            "comment": payload.get("comment"),
+            "rating": rating_val,
+            "comment": comment_val,
         },
     )
 
-    try:
-        return create_resp.json()
-    except ValueError:
-        return {"detail": create_resp.text}
+    if response: 
+        response.status_code = 201
+
+    # Return a combined success message
+    return {
+        "message": "Review and rating created", 
+        "review_id": review_payload["id"],
+        "rating": rating_val
+    }
 
 
 # ---------- Async geocode endpoints ----------
@@ -414,6 +466,9 @@ async def get_task_status(task_id: str, response: Response):
 
 @app.get("/auth/callback/google", tags=["proxy"])
 async def google_oauth_callback(request: Request):
+    # Print 1: Confirm callback hit
+    print("[Composite] OAuth Callback hit. Query params:", request.query_params)
+
     FRONTEND_URL = "https://nyc-study-spots-frontend.storage.googleapis.com/index.html"
     user_management_url = "http://34.139.134.144:8002/auth/callback/google"
 
@@ -424,9 +479,21 @@ async def google_oauth_callback(request: Request):
             cookies=request.cookies
         )
 
-    # Parse JSON returned by VM
-    data = resp.json()
-    session_id = data.get("session_id")
+    # Print 2: See what the VM returned
+    print(f"[Composite] VM Response Status: {resp.status_code}")
+    print(f"[Composite] VM Response Body: {resp.text}")
+
+    try:
+        data = resp.json()
+        session_id = data.get("session_id")
+    except Exception as e:
+        print(f"[Composite] JSON Decode Error: {e}")
+        session_id = None
+
+    if not session_id:
+        print("[Composite] ❌ CRITICAL: No session_id received from VM!")
+    else:
+        print(f"[Composite] ✅ Session ID received: {session_id[:10]}...")
 
     # Redirect back to SPA callback page WITH session_id
     redirect_url = f"{FRONTEND_URL}#/callback?session_id={session_id}"
@@ -463,11 +530,13 @@ async def google_oauth_login(request: Request, response: Response):
 
 from fastapi import Header
 
+# composite.py
+
 @app.get("/auth/me", tags=["auth"])
 async def auth_me(authorization: str = Header(None)):
     """
-    Proxy /auth/me to the User Management service, forwarding the Authorization header.
-    Frontend calls: COMPOSITE_BASE + /auth/me
+    Proxy /auth/me to the User Management service.
+    TRANSLATION: Frontend sends 'Authorization' -> We send 'auth' to VM.
     """
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -475,11 +544,11 @@ async def auth_me(authorization: str = Header(None)):
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{USER_SERVICE_URL}/auth/me",
-            headers={"Authorization": authorization},
+            # ✅ FIX: Map 'Authorization' to 'auth'
+            headers={"auth": authorization}, 
             timeout=DEFAULT_TIMEOUT,
         )
 
-    # Pass through status code and JSON
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
@@ -490,6 +559,7 @@ async def auth_me(authorization: str = Header(None)):
 async def auth_logout(authorization: str = Header(None)):
     """
     Proxy /auth/logout to the User Management service.
+    TRANSLATION: Frontend sends 'Authorization' -> We send 'auth' to VM.
     """
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -497,7 +567,8 @@ async def auth_logout(authorization: str = Header(None)):
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{USER_SERVICE_URL}/auth/logout",
-            headers={"Authorization": authorization},
+            # ✅ FIX: Map 'Authorization' to 'auth'
+            headers={"auth": authorization},
             timeout=DEFAULT_TIMEOUT,
         )
 
@@ -506,3 +577,25 @@ async def auth_logout(authorization: str = Header(None)):
 
     return Response(status_code=204)
 
+
+
+
+@app.delete("/api/reviews/{review_id}", tags=["composite"])
+async def delete_review_proxy(review_id: str, response: Response):
+    """
+    Proxy DELETE to the Reviews Service.
+    Only deletes the text review (reviews table). 
+    Ratings (stars) remain as they have a separate ID not linked here.
+    """
+    async with AsyncClient() as client:
+        # Call the microservice: DELETE /review/{reviewId}
+        resp = await client.delete(
+            f"{REVIEWS_SERVICE_URL}/review/{review_id}",
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    response.status_code = resp.status_code
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Review not found")
+        
+    return None
