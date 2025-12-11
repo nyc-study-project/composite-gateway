@@ -13,6 +13,10 @@ from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4
 from google.cloud import pubsub_v1
+from concurrent.futures import ThreadPoolExecutor
+import httpx
+executor = ThreadPoolExecutor(max_workers=5)
+
 
 COMPOSITE_SERVICE_NAME = "Composite Gateway"
 
@@ -116,8 +120,17 @@ async def root():
     return {"message": "Welcome to the Composite Gateway API. See /docs."}
 
 
+def fetch_all_users_blocking():
+    with httpx.Client(timeout=DEFAULT_TIMEOUT) as client:
+        r = client.get(f"{USER_SERVICE_URL}/users")
+        r.raise_for_status()
+        return r.json()
+
+
 @app.get("/composite/spots/{spot_id}/full", tags=["composite"])
 async def get_spot_full(spot_id: str):
+    user_future = executor.submit(fetch_all_users_blocking)
+
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
             results = await asyncio.gather(
@@ -125,13 +138,21 @@ async def get_spot_full(spot_id: str):
                 client.get(f"{REVIEWS_SERVICE_URL}/reviews/{spot_id}", timeout=DEFAULT_TIMEOUT),
                 client.get(f"{REVIEWS_SERVICE_URL}/ratings/{spot_id}", timeout=DEFAULT_TIMEOUT),
                 client.get(f"{REVIEWS_SERVICE_URL}/ratings/{spot_id}/average", timeout=DEFAULT_TIMEOUT),
-                client.get(f"{USER_SERVICE_URL}/users", timeout=DEFAULT_TIMEOUT),
                 return_exceptions=True
             )
-            spot_res, review_res, rating_res, avg_res, user_res = results
 
-            spot = spot_res.json().get("data", spot_res.json()) if not isinstance(spot_res, Exception) and spot_res.status_code == 200 else None
-            users = user_res.json() if not isinstance(user_res, Exception) and user_res.status_code == 200 else []
+            spot_res, review_res, rating_res, avg_res = results
+
+            try:
+                users = user_future.result()
+            except Exception:
+                users = []
+
+            spot = (
+                spot_res.json().get("data", spot_res.json())
+                if not isinstance(spot_res, Exception) and spot_res.status_code == 200
+                else None
+            )
 
             def unwrap_list(response):
                 if isinstance(response, Exception) or response.status_code != 200:
@@ -157,7 +178,12 @@ async def get_spot_full(spot_id: str):
         except Exception as e:
             raise HTTPException(500, str(e))
 
-    return {"spot": spot, "reviews": reviews, "users": users, "rating_summary": rating_summary}
+    return {
+        "spot": spot,
+        "reviews": reviews,
+        "users": users,
+        "rating_summary": rating_summary
+    }
 
 
 @app.get("/api/spots/{spot_id}", tags=["proxy"])
@@ -383,7 +409,6 @@ async def google_oauth_callback(request: Request):
     FRONTEND_URL = "https://nyc-study-spots-frontend.storage.googleapis.com/index.html"
     user_management_url = "http://34.139.134.144:8002/auth/callback/google"
     
-    # 1. Forward request to User Service
     async with AsyncClient() as client:
         try:
             resp = await client.get(
@@ -398,7 +423,6 @@ async def google_oauth_callback(request: Request):
     if resp.status_code != 200:
         return RedirectResponse(url=f"{FRONTEND_URL}#/error?msg=LoginFailed")
 
-    # 2. Extract JWT (formerly session_id)
     try:
         data = resp.json()
         token = data.get("jwt")
