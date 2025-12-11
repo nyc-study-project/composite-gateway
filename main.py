@@ -70,6 +70,18 @@ app.add_middleware(
 )
 
 
+def _get_auth_headers(request: Request) -> dict:
+    """Helper to extract token from Cookie or Header and format for User Service."""
+    token = request.cookies.get("access_token")
+    
+    if not token:
+        # Fallback: Check Authorization header (for API calls/Mobile)
+        auth = request.headers.get("Authorization") or request.headers.get("auth")
+        if auth:
+            token = auth.split(" ")[1] if "Bearer" in auth else auth
+            
+    return {"auth": f"Bearer {token}"} if token else {}
+
 async def _get_json(client: AsyncClient, url: str):
     try:
         resp = await client.get(url, timeout=DEFAULT_TIMEOUT)
@@ -237,10 +249,16 @@ async def proxy_list_spots(
 
 
 @app.get("/api/users/{user_id}", tags=["proxy"])
-async def proxy_get_user(user_id: str, response: Response):
+async def proxy_get_user(user_id: str, request: Request, response: Response):
+    headers = _get_auth_headers(request)
+
     async with AsyncClient() as client:
         try:
-            resp = await client.get(f"{USER_SERVICE_URL}/users/{user_id}", timeout=DEFAULT_TIMEOUT)
+            resp = await client.get(
+                f"{USER_SERVICE_URL}/users/{user_id}", 
+                headers=headers,
+                timeout=DEFAULT_TIMEOUT
+            )
         except RequestError as e:
             raise HTTPException(502, f"User service error: {e}")
 
@@ -249,7 +267,6 @@ async def proxy_get_user(user_id: str, response: Response):
         return resp.json()
     except ValueError:
         return {"detail": resp.text}
-
 
 @app.post("/api/reviews", tags=["composite"])
 async def create_review_with_fk_check(payload: dict = Body(...), response: Response = None):
@@ -365,33 +382,48 @@ async def get_task_status(task_id: str, response: Response):
 async def google_oauth_callback(request: Request):
     FRONTEND_URL = "https://nyc-study-spots-frontend.storage.googleapis.com/index.html"
     user_management_url = "http://34.139.134.144:8002/auth/callback/google"
-    cookies = dict(request.cookies)
-
+    
+    # 1. Forward request to User Service
     async with AsyncClient() as client:
         try:
             resp = await client.get(
                 user_management_url,
                 params=request.query_params,
-                cookies=cookies,
+                cookies=request.cookies,
                 timeout=10.0
             )
         except RequestError as e:
             raise HTTPException(502, f"Could not connect to User Service: {e}")
 
     if resp.status_code != 200:
-        raise HTTPException(resp.status_code, "Login failed in User Service")
-
-    try:
-        data = resp.json()
-        session_id = data.get("session_id")
-    except Exception:
-        session_id = None
-
-    if not session_id:
         return RedirectResponse(url=f"{FRONTEND_URL}#/error?msg=LoginFailed")
 
-    redirect_url = f"{FRONTEND_URL}#/callback?session_id={session_id}"
-    return RedirectResponse(url=redirect_url)
+    # 2. Extract JWT (formerly session_id)
+    try:
+        data = resp.json()
+        token = data.get("jwt")
+    except Exception:
+        token = None
+
+    if not token:
+        return RedirectResponse(url=f"{FRONTEND_URL}#/error?msg=NoToken")
+
+    # 3. Redirect with token in URL (Keeps Frontend compatible)
+    # The frontend likely looks for 'session_id', so we trick it by passing the JWT there.
+    redirect_url = f"{FRONTEND_URL}#/callback?session_id={token}"
+    response = RedirectResponse(url=redirect_url)
+
+    # 4. Set HttpOnly Cookie (Best Practice for persistence)
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite="none",
+        secure=True, 
+        max_age=3600   # 1 hour
+    )
+    
+    return response
 
 
 @app.get("/auth/login/google", tags=["proxy"])
@@ -403,7 +435,8 @@ async def google_oauth_login(request: Request, response: Response):
             resp = await client.get(
                 user_management_url,
                 params=request.query_params,
-                follow_redirects=False
+                cookies=request.cookies, 
+                timeout=10.0
             )
         except RequestError as e:
             raise HTTPException(502, f"Downstream unreachable: {e}")
@@ -418,15 +451,17 @@ async def google_oauth_login(request: Request, response: Response):
 
 
 @app.get("/auth/me", tags=["auth"])
-async def auth_me(authorization: str = Header(None)):
-    if not authorization:
-        raise HTTPException(401, "Missing Authorization header")
+async def auth_me(request: Request):
+    headers = _get_auth_headers(request)
+    
+    if not headers:
+        raise HTTPException(401, "Missing Authorization credentials")
 
     async with AsyncClient() as client:
         try:
             resp = await client.get(
                 f"{USER_SERVICE_URL}/auth/me",
-                headers={"auth": authorization},
+                headers=headers,
                 timeout=DEFAULT_TIMEOUT,
             )
         except RequestError as e:
@@ -439,24 +474,9 @@ async def auth_me(authorization: str = Header(None)):
 
 
 @app.post("/auth/logout", status_code=204, tags=["auth"])
-async def auth_logout(authorization: str = Header(None)):
-    if not authorization:
-        raise HTTPException(401, "Missing Authorization header")
-
-    async with AsyncClient() as client:
-        try:
-            resp = await client.post(
-                f"{USER_SERVICE_URL}/auth/logout",
-                headers={"auth": authorization},
-                timeout=DEFAULT_TIMEOUT,
-            )
-        except RequestError as e:
-            raise HTTPException(502, f"Downstream unreachable: {e}")
-
-    if resp.status_code >= 400:
-        raise HTTPException(resp.status_code, resp.text)
-
-    return Response(status_code=204)
+async def auth_logout(request: Request, response: Response):
+    response.delete_cookie("access_token")
+    return response
 
 
 @app.delete("/api/reviews/{review_id}", tags=["composite"])
