@@ -23,7 +23,7 @@ USER_SERVICE_URL = "http://34.139.134.144:8002"
 SPOT_SERVICE_URL = "https://spot-management-642518168067.us-east1.run.app"
 REVIEWS_SERVICE_URL = "https://reviews-api-c73xxvyjwq-ue.a.run.app"
 
-DEFAULT_TIMEOUT = 5.0  # seconds
+DEFAULT_TIMEOUT = 20.0  # seconds
 
 GCP_PROJECT_ID = "study-spot-nyc"
 PUBSUB_TOPIC_ID = "composite-events"
@@ -246,13 +246,14 @@ async def proxy_list_reviews(
     spot_id: Optional[str] = None,
     response: Response = None,
 ):
-    query = f"?spot_id={spot_id}" if spot_id else ""
+
+    if spot_id:
+        url = f"{REVIEWS_SERVICE_URL}/reviews/{spot_id}"
+    else:
+        url = f"{REVIEWS_SERVICE_URL}/reviews" 
 
     async with AsyncClient() as client:
-        resp = await client.get(
-            f"{REVIEWS_SERVICE_URL}/reviews{query}",
-            timeout=DEFAULT_TIMEOUT,
-        )
+        resp = await client.get(url, timeout=DEFAULT_TIMEOUT)
 
     if response is not None:
         response.status_code = resp.status_code
@@ -396,10 +397,10 @@ async def create_review_with_fk_check(
         for res in results:
             if isinstance(res, Exception):
                 print(f"[Composite] Error saving review/rating: {res}")
-                # We continue anyway to attempt to return success, 
-                # but in production, you might want to rollback.
+                raise HTTPException(status_code=500, detail=f"Downstream error: {res}")
             elif hasattr(res, 'status_code') and res.status_code >= 400:
                  print(f"[Composite] Downstream error: {res.status_code} - {res.text}")
+                 raise HTTPException(status_code=res.status_code, detail=f"Review service failed: {res.text}")
 
     # 4) Emit Pub/Sub event
     emit_event(
@@ -466,22 +467,34 @@ async def get_task_status(task_id: str, response: Response):
 
 @app.get("/auth/callback/google", tags=["proxy"])
 async def google_oauth_callback(request: Request):
-    # Print 1: Confirm callback hit
     print("[Composite] OAuth Callback hit. Query params:", request.query_params)
 
     FRONTEND_URL = "https://nyc-study-spots-frontend.storage.googleapis.com/index.html"
+    
+    # ⚠️ NOTE: Hardcoding IPs is risky. If the VM restarts, this IP might change.
     user_management_url = "http://34.139.134.144:8002/auth/callback/google"
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            user_management_url,
-            params=request.query_params,
-            cookies=request.cookies
-        )
+    # Convert request cookies to a standard dict to ensure compatibility
+    cookies = dict(request.cookies)
 
-    # Print 2: See what the VM returned
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(
+                user_management_url,
+                params=request.query_params,
+                cookies=cookies,
+                timeout=10.0  # Increased timeout for safety
+            )
+        except httpx.RequestError as exc:
+            print(f"[Composite] ❌ Connection failed to User Management: {exc}")
+            raise HTTPException(status_code=502, detail=f"Could not connect to User Service: {exc}")
+
     print(f"[Composite] VM Response Status: {resp.status_code}")
-    print(f"[Composite] VM Response Body: {resp.text}")
+    
+    # Handle cases where the VM returns an error (like 400 or 500)
+    if resp.status_code != 200:
+        print(f"[Composite] ❌ User Service returned error: {resp.text}")
+        raise HTTPException(status_code=resp.status_code, detail="Login failed in User Service")
 
     try:
         data = resp.json()
@@ -492,13 +505,13 @@ async def google_oauth_callback(request: Request):
 
     if not session_id:
         print("[Composite] ❌ CRITICAL: No session_id received from VM!")
-    else:
-        print(f"[Composite] ✅ Session ID received: {session_id[:10]}...")
+        # Optional: Redirect to an error page instead of crashing
+        return RedirectResponse(url=f"{FRONTEND_URL}#/error?msg=LoginFailed")
 
-    # Redirect back to SPA callback page WITH session_id
+    print(f"[Composite] ✅ Session ID received: {session_id[:10]}...")
+
     redirect_url = f"{FRONTEND_URL}#/callback?session_id={session_id}"
     return RedirectResponse(url=redirect_url)
-
 
 @app.get("/auth/login/google", tags=["proxy"])
 async def google_oauth_login(request: Request, response: Response):
