@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Body, Response, Request
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
@@ -230,6 +231,39 @@ async def proxy_list_reviews(
         return {"detail": resp.text}
 
 
+# Add this to main.py to handle the list view!
+@app.get("/api/spots", tags=["proxy"])
+async def proxy_list_spots(
+    response: Response,
+    page: int = 1,
+    page_size: int = 10,
+    city: Optional[str] = None,
+    open_now: Optional[bool] = None
+):
+    """
+    Proxies the list/search endpoint to the Spot Service.
+    Matches the frontend call: GET /api/spots?page=1...
+    """
+    params = {"page": page, "page_size": page_size}
+    if city:
+        params["city"] = city
+    if open_now is not None:
+        params["open_now"] = str(open_now).lower()
+
+    async with AsyncClient() as client:
+        resp = await client.get(
+            f"{SPOT_SERVICE_URL}/studyspots", 
+            params=params,
+            timeout=DEFAULT_TIMEOUT
+        )
+
+    response.status_code = resp.status_code
+    try:
+        return resp.json()
+    except ValueError:
+        return {"detail": resp.text}
+
+
 @app.get("/api/users/{user_id}", tags=["proxy"])
 async def proxy_get_user(user_id: str, response: Response):
     async with AsyncClient() as client:
@@ -379,29 +413,25 @@ async def get_task_status(task_id: str, response: Response):
 
 
 @app.get("/auth/callback/google", tags=["proxy"])
-async def google_oauth_callback(request: Request, response: Response):
-    """
-    Proxy endpoint that forwards the Google OAuth callback request to the User Management service.
-    """
-    print("COOKIES RECEIVED:", request.cookies)
+async def google_oauth_callback(request: Request):
+    FRONTEND_URL = "https://nyc-study-spots-frontend.storage.googleapis.com/index.html"
     user_management_url = "http://34.139.134.144:8002/auth/callback/google"
-    
+
     async with httpx.AsyncClient() as client:
-        # Pass cookies from the browser (request.cookies) to the VM
         resp = await client.get(
-            user_management_url, 
-            params=request.query_params, 
-            cookies=request.cookies  # <--- THIS IS THE FIX
+            user_management_url,
+            params=request.query_params,
+            cookies=request.cookies
         )
-        
-        response.status_code = resp.status_code
-        
-        # Pass headers (including Set-Cookie) back to the browser
-        for key, value in resp.headers.items():
-            if key.lower() not in ["content-length", "content-encoding"]:
-                response.headers[key] = value
-                
-        return resp.text
+
+    # Parse JSON returned by VM
+    data = resp.json()
+    session_id = data.get("session_id")
+
+    # Redirect back to SPA callback page WITH session_id
+    redirect_url = f"{FRONTEND_URL}#/callback?session_id={session_id}"
+    return RedirectResponse(url=redirect_url)
+
 
 @app.get("/auth/login/google", tags=["proxy"])
 async def google_oauth_login(request: Request, response: Response):
@@ -428,3 +458,51 @@ async def google_oauth_login(request: Request, response: Response):
 
     #port = int(os.environ.get("FASTAPIPORT", 8000))
     #uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
+
+
+from fastapi import Header
+
+@app.get("/auth/me", tags=["auth"])
+async def auth_me(authorization: str = Header(None)):
+    """
+    Proxy /auth/me to the User Management service, forwarding the Authorization header.
+    Frontend calls: COMPOSITE_BASE + /auth/me
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{USER_SERVICE_URL}/auth/me",
+            headers={"Authorization": authorization},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    # Pass through status code and JSON
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    return resp.json()
+
+
+@app.post("/auth/logout", status_code=204, tags=["auth"])
+async def auth_logout(authorization: str = Header(None)):
+    """
+    Proxy /auth/logout to the User Management service.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{USER_SERVICE_URL}/auth/logout",
+            headers={"Authorization": authorization},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    return Response(status_code=204)
+
