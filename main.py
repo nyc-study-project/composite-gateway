@@ -545,3 +545,33 @@ async def get_batch_ratings(payload: dict = Body(...)):
             results[sid] = data.get("average_rating", 0) or 0
             
     return results
+
+
+
+
+@app.get("/proxy/user/health", tags=["internal"])
+async def proxy_user_health():
+    """
+    Server-side health proxy to avoid cors nonsense
+    """
+    async with AsyncClient() as client:
+        try:
+            resp = await client.get(
+                f"{USER_SERVICE_URL}/health",
+                timeout=5.0,
+            )
+        except RequestError:
+            return Response(
+                content=json.dumps({
+                    "status": "unreachable",
+                    "service": "User Service",
+                }),
+                status_code=503,
+                media_type="application/json",
+            )
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
