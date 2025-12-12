@@ -519,3 +519,29 @@ async def delete_review_proxy(review_id: str, response: Response):
         raise HTTPException(404, "Review not found")
 
     return None
+
+
+@app.post("/composite/ratings/batch", tags=["composite"])
+async def get_batch_ratings(payload: dict = Body(...)):
+    """
+    Input:  { "ids": ["uuid-1", "uuid-2"] }
+    Output: { "uuid-1": 4.5, "uuid-2": 3.2 }
+    """
+    spot_ids = payload.get("ids", [])
+    if not spot_ids:
+        return {}
+
+    async with AsyncClient() as client:
+        tasks = [
+            client.get(f"{REVIEWS_SERVICE_URL}/ratings/{sid}/average", timeout=5.0)
+            for sid in spot_ids
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = {}
+    for sid, resp in zip(spot_ids, responses):
+        if not isinstance(resp, Exception) and resp.status_code == 200:
+            data = resp.json().get("data", {})
+            results[sid] = data.get("average_rating", 0) or 0
+            
+    return results
